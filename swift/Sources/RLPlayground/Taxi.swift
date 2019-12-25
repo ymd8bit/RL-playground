@@ -2,7 +2,7 @@ import TensorFlow
 import Python
 
 
-public class Taxi {
+public class Taxi : Env{
 
     enum Action: Int {
         case up = 0, right, down, left, pickUp, dropOff
@@ -10,46 +10,42 @@ public class Taxi {
     typealias State = Int
     typealias Reward = Float
   
-    public var name: String
     public var α: Float, ε: Float, γ: Float, εDecay: Float
-    public var numEpisodes: Int, numActions: Int, numStates: Int
-    public var enableRender: Bool
-    public var useSaved: String?
     public var Q: Tensor<Float>
-    private var np: PythonObject, gym: PythonObject, env: PythonObject
   
-    init(_ name: String, α: Float = 0.01, ε: Float = 0.3, γ: Float = 0.95, numEpisodes: Int = 3000, εDecay: Float = 0.00005, enableRender: Bool = false, useSaved: Optional<String> = nil) {
-        np = Python.import("numpy")
-        gym = Python.import("gym")
-        env = gym.make("Taxi-v3")
+    init(_ name: String, numEpisodes: Int = 3000, α: Float = 0.01, ε: Float = 0.3, γ: Float = 0.95, εDecay: Float = 0.00005, enableRender: Bool = false, useSaved: Optional<String> = nil) {
+        let gym = Python.import("gym")
+        let env = gym.make("Taxi-v3")
   
-        self.name = name
         self.α = α
         self.ε = ε
         self.γ = γ
-        self.numEpisodes = numEpisodes
         self.εDecay = εDecay
-        self.enableRender = enableRender
-        self.useSaved = useSaved
-  
-        numActions = Int(env.action_space.n)!
-        numStates = Int(env.observation_space.n)!
-        let shape = TensorShape([numStates, numActions])
+        let shape = TensorShape([Int(env.observation_space.n)!, Int(env.action_space.n)!])
 
         if useSaved == nil {
             Q = Tensor<Float>(repeating: 0, shape: shape)
         } else { 
             let path = useSaved!
             Q = loadTensor(path: path)
-            assert(Q.shape == shape)
             print("loaded a tensor from:", path)
         }
+
+        super.init(name, env, numEpisodes, enableRender: enableRender, useSaved: useSaved)
+    }
+
+    public func getNumActions() -> Int {
+        return Int(env.action_space.n)!
+    }
+
+    public func getNumStates() -> Int {
+        return Int(env.observation_space.n)!
     }
   
     private func εGreedy(_ s: State, _ ε: Float = 0.1) -> Action {
         if Float.random(in: 0...1) < ε {
             // pick up an action from the action space
-            let i = Int.random(in: 0..<numActions)
+            let i = Int.random(in: 0..<getNumActions())
             return Action(rawValue: i)!
         } 
         return greedy(s)
