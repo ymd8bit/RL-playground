@@ -14,8 +14,11 @@ func playTaxi() {
   print(String(format: "time: %.10f s", time))
 }
 
-func playCartPole() {}
+func playCartPole() {
+  let cartPole = CartPole("cartPole", numEpisodes: 1, enableRender: true)
+  cartPole.play()
+}
 
-playMaze()
+// playMaze()
 // playTaxi()
-// playCartPole()
+playCartPole()

@@ -13,7 +13,15 @@ public class Taxi : Env{
     public var α: Float, ε: Float, γ: Float, εDecay: Float
     public var Q: Tensor<Float>
   
-    init(_ name: String, numEpisodes: Int = 3000, α: Float = 0.01, ε: Float = 0.3, γ: Float = 0.95, εDecay: Float = 0.00005, enableRender: Bool = false, useSaved: Optional<String> = nil) {
+    init(_ name: String,
+         numEpisodes: Int = 3000,
+         α: Float = 0.01,
+         ε: Float = 0.3,
+         γ: Float = 0.95,
+         εDecay: Float = 0.00005,
+         enableRender: Bool = false,
+         useSaved: Optional<String> = nil) 
+    {
         let gym = Python.import("gym")
         let env = gym.make("Taxi-v3")
   
@@ -21,7 +29,9 @@ public class Taxi : Env{
         self.ε = ε
         self.γ = γ
         self.εDecay = εDecay
-        let shape = TensorShape([Int(env.observation_space.n)!, Int(env.action_space.n)!])
+        let numStates = Int(env.observation_space.n)!
+        let numActions = Int(env.action_space.n)!
+        let shape = TensorShape([numStates, numActions])
 
         if useSaved == nil {
             Q = Tensor<Float>(repeating: 0, shape: shape)
@@ -31,22 +41,12 @@ public class Taxi : Env{
             print("loaded a tensor from:", path)
         }
 
-        super.init(name, env, numEpisodes, enableRender: enableRender, useSaved: useSaved)
+        super.init(name, env, numEpisodes, numStates, numActions, enableRender: enableRender, useSaved: useSaved)
     }
 
-    public func getNumActions() -> Int {
-        return Int(env.action_space.n)!
-    }
-
-    public func getNumStates() -> Int {
-        return Int(env.observation_space.n)!
-    }
-  
     private func εGreedy(_ s: State, _ ε: Float = 0.1) -> Action {
         if Float.random(in: 0...1) < ε {
-            // pick up an action from the action space
-            let i = Int.random(in: 0..<getNumActions())
-            return Action(rawValue: i)!
+            return random(s)
         } 
         return greedy(s)
     }
@@ -55,6 +55,11 @@ public class Taxi : Env{
         // just return the action having highest score
         let i = Int(Q[s].argmax().scalarized())
         return Action(rawValue: i)!
+    }
+
+    private func random(_ s: State) -> Action {
+        let a = Int.random(in: 0...numActions-1)
+        return Action(rawValue: a)!
     }
   
     private func update(_ s: State, _ a: Action, _ r: Reward, _ s_next: State) {

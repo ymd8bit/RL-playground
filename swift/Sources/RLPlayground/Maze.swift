@@ -39,7 +39,9 @@ public class Maze : Env {
 
         hight = Array(env.observation_space.high)![0] + 1
         width = Array(env.observation_space.high)![1] + 1
-        let shape: TensorShape = [hight, width]
+        let numStates = hight * width
+        let numActions = Int(env.action_space.n)!
+        let shape: TensorShape = [numStates, numActions]
 
         if useSaved == nil {
             Q = Tensor<Float>(repeating: 0, shape: shape)
@@ -49,21 +51,12 @@ public class Maze : Env {
             print("loaded a tensor from:", path)
         }
 
-        super.init(name, env, numEpisodes, enableRender: enableRender, useSaved: useSaved)
-    }
-
-    public func getNumActions() -> Int {
-        return Int(env.action_space.n)!
-    }
-
-    public func getNumStates() -> Int {
-        return hight * width
+        super.init(name, env, numEpisodes, numStates, numActions, enableRender: enableRender, useSaved: useSaved)
     }
 
     private func εGreedy(_ s: State, ε: Float) -> Action {
         if Float.random(in: 0...1) < ε {
-            let a = Int.random(in: 0..<getNumActions())
-            return Action(rawValue: a)!
+            return random(s)
         } 
         return greedy(s)
     }
@@ -74,7 +67,7 @@ public class Maze : Env {
     }
 
     private func random(_ s: State) -> Action {
-        let a = Int.random(in: 0...getNumActions()-1)
+        let a = Int.random(in: 0...numActions-1)
         return Action(rawValue: a)!
     }
 

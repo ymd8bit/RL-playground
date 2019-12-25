@@ -1,54 +1,129 @@
-// import Foundation
-// import Python
-// import Tensorflow
+import Foundation
+import Python
+import TensorFlow
 
-// public class CartPole {
+public class CartPole : Env {
+    public enum Action: Int {
+        case left = 0, right
+    }
+    typealias State = Tensor<Float>
+    typealias Reward = Float
 
-//     public enum Action: Int {
-//         case right, left
-//     }
-//     typealias State = Int
-//     typealias Reward = Float
+    private struct Net: Layer {
+        typealias Input = State
+        typealias Output = Tensor<Float>
 
-//     public var name: String
-//     public var ε: Float
-//     public var enable_render: Bool
-//     public var useSaved: String?
-//     public var hight: Int, width: Int, n_action: Int
-//     public var Q: Tensor<Float>
-//     private var np: PythonObject, gym: PythonObject, gym_maze: PythonObject, env: PythonObject
+        var l1, l2: Dense<Float>
 
-//     init(_ name: String,
-//          ε: Float = 0.1,
-//          enable_render: Bool = true,
-//          useSaved: Optional<String> = nil) 
-//     {
-//         np = Python.import("numpy")
-//         gym = Python.import("gym")
-//         env = gym.make("maze-sample-5x5-v0", enable_render:enable_render)
+        init(inputSize: Int, hiddenSize: Int, outputSize: Int) {
+            l1 = Dense<Float>(inputSize: inputSize, outputSize: hiddenSize, activation: relu)
+            l2 = Dense<Float>(inputSize: hiddenSize, outputSize: outputSize)
+        }
 
-//         self.name = name
-//         self.ε = ε
-//         self.η = η
-//         self.γ = γ
-//         self.enable_render = enable_render
-//         self.useSaved = useSaved
+        @differentiable
+        func callAsFunction(_ input: Input) -> Output {
+            return input.sequenced(through: l1, l2)
+        }
+    }
 
-//         hight = Array(env.observation_space.high)![0] + 1
-//         width = Array(env.observation_space.high)![1] + 1
-//         n_action = Int(env.action_space.n)!
-//         let shape = TensorShape([hight * width, n_action])
 
-//         if useSaved == nil {
-//             Q = Tensor<Float>(repeating: 0, shape: shape)
-//         } else { 
-//             let path = useSaved!
-//             Q = loadTensor(path: path)
-//             assert(Q.shape == shape)
-//             print("loaded a tensor from:", path)
-//         }
-//     }
-// }
+    public var np: PythonObject
+    public var ε: Float, γ: Float
+    private var Q: Net
+    // public var mainQ: Net, targetQ: Net
+
+    init(_ name: String,
+         numEpisodes: Int = 1,
+         ε: Float = 0.1,
+         γ: Float = 0.99,
+         enableRender: Bool = true,
+         useSaved: Optional<String> = nil) 
+    {
+        np = Python.import("numpy")
+        let gym = Python.import("gym")
+        let env = gym.make("CartPole-v0")
+
+        self.ε = ε
+        self.γ = γ
+
+        let numStates = Array<Int>(env.observation_space.shape)![0]
+        let numActions = Int(env.action_space.n)!
+
+        // if useSaved == nil {
+        Q = Net(inputSize: numStates,  hiddenSize: 16, outputSize: numActions)
+        // } else { 
+        //     let path = useSaved!
+        //     Q = loadTensor(path: path)
+        //     print("loaded a tensor from:", path)
+        // }
+
+        super.init(name, env, numEpisodes, numStates, numActions, enableRender: enableRender, useSaved: useSaved)
+    }
+
+    private func εGreedy(_ s: State, ε: Float) -> Action {
+        if Float.random(in: 0...1) < ε {
+            return random(s)
+        } 
+        return greedy(s)
+    }
+
+    private func greedy(_ s: State) -> Action {
+        let a = Int(Q(s).argmax().scalarized())
+        return Action(rawValue: a)!
+    }
+
+    private func random(_ s: State) -> Action {
+        let a = Int.random(in: 0...numActions-1)
+        return Action(rawValue: a)!
+    }
+
+    // private func update(_ s: State, _ a: Action, _ r: Reward, _ s_next: State, _ a_next: State) {
+    //     let label = r + γ * Float(Q(s_next).argmax().scalarized())
+    //     let labels = [label]
+    //     Q[s][a.rawValue] = u + v
+    // }
+
+    private func step(env: PythonObject, a: Action) -> (State, Reward, Bool, PythonObject) {
+        let (s_next, r, done, info) = env.step(a.rawValue).tuple4
+        return (makeState(s_next), Float(r)!, Bool(done)!, info)
+    }
+
+    public func play() {
+        for ep in 0..<numEpisodes {
+            var s = makeState(env.reset())
+            var rTotal: Reward = 0
+
+            while true {
+                let a = εGreedy(s, ε: ε)
+                print(a)
+                let (s_next, r, done, _) = step(env: env, a: a)
+                env.render()
+                usleep(50000)
+
+                // if enableRender {
+                //     print("s: \(s), a: \(a), r: \(r), done: \(done)")
+                //     env.render()
+                //     usleep(100000)
+                // }
+                // a_next = εGreedy(s, ε: ε)
+                // update(s, a, r, s_next, a_next)
+
+                s = s_next
+                rTotal += r
+                if(done) { break }
+            }
+
+            if ep % 100 == 0 {
+                print("episode: \(ep), total_reward: \(rTotal)")
+            }
+        }
+    }
+
+    func makeState(_ s: PythonObject) -> State {
+        let array = np.array([s]).astype(np.float32)
+        return State(numpy: array)!
+    }
+}
 /// Model parameters and hyperparameters.
 // let hiddenSize = 128
 // let batchSize = 16
@@ -67,22 +142,6 @@
 // }
 
 // /// A simple two layer dense net.
-// struct Net: Layer {
-//     typealias Input = Tensor<Float>
-//     typealias Output = Tensor<Float>
-
-//     var l1, l2: Dense<Float>
-
-//     init(observationSize: Int, hiddenSize: Int, actionCount: Int) {
-//         l1 = Dense<Float>(inputSize: observationSize, outputSize: hiddenSize, activation: relu)
-//         l2 = Dense<Float>(inputSize: hiddenSize, outputSize: actionCount)
-//     }
-
-//     @differentiable
-//     func callAsFunction(_ input: Input) -> Output {
-//         return input.sequenced(through: l1, l2)
-//     }
-// }
 
 // /// An episode is a list of steps, where each step records the observation from
 // /// env and the action taken. They will serve respectively as the input and
