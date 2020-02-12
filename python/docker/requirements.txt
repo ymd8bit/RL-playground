@@ -1,0 +1,10 @@
+numpy
+Pillow
+matplotlib
+pandas
+autopep8
+pycodestyle
+pydocstyle
+torch
+torchvision
+onnx
