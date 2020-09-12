@@ -97,24 +97,15 @@ class Agent:
         return action
 
     @torch.no_grad()
-    def play_step(self, net: nn.Module, epsilon: float = 0.0, device: str = 'cpu') -> Tuple[float, bool]:
+    def play_step(self, net: nn.Module, epsilon: float = 0.0, device: str = 'cpu', render: bool = False) -> Tuple[float, bool]:
         action = self.get_action(net, epsilon, device)
+
+        if render:
+            self.env.render()
+
         new_state, reward, done, _ = self.env.step(action)
         exp = Experience(self.state, action, reward, done, new_state)
         self.replay_buffer.append(exp)
-        self.state = new_state
-
-        if done:
-            self.reset()
-        return reward, done
-
-    @torch.no_grad()
-    def eval_step(self, net: nn.Module, epsilon: float = 0.0, device: str = 'cpu', render: bool = False) -> Tuple[float, bool]:
-        action = self.get_action(net, epsilon, device)
-        new_state, reward, done, _ = self.env.step(action)
-        if render:
-            self.env.render()
-            time.sleep((1 / 60) * 0.001)
         self.state = new_state
 
         if done:
@@ -238,16 +229,18 @@ def train(hparams) -> None:
 
 
 def test(hparams) -> None:
-    assert hparams.ckpt_path != ''
+    assert hparams.ckpt_path != '', 'you must take an path to checkpoint when test'
     model = DQNModule.load_from_checkpoint(
         hparams.ckpt_path, env='SuperMarioBros-v0')
     qnet = model.net
     agent = model.agent
     epsilon = max(hparams.eps_end, hparams.eps_start -
                   model.global_step + 1 / hparams.eps_last_frame)
+    fps = 60
 
     for ep in range(hparams.episode_length):
-        agent.eval_step(qnet, epsilon, device='cpu', render=True)
+        agent.play_step(qnet, epsilon, device='cpu', render=True)
+        time.sleep((1 / fps) * 0.001)
     # trainer = pl.Trainer(
     #     gpus=hparams.gpus,
     #     max_epochs=1000,
