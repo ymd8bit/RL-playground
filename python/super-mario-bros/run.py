@@ -114,6 +114,20 @@ class Agent:
             self.reset()
         return reward, done
 
+    @torch.no_grad()
+    def eval_step(self, net: nn.Module, epsilon: float = 0.0, device: str = 'cpu', render: bool = False) -> Tuple[float, bool]:
+        action = self.get_action(net, epsilon, device)
+
+        if render:
+            self.env.render()
+
+        new_state, reward, done, _ = self.env.step(action)
+        self.state = new_state
+
+        if done:
+            self.reset()
+        return reward, done
+
 
 env_keys = ['cartpole', 'super-mario-bros']
 
@@ -187,7 +201,7 @@ class DQNModule(pl.LightningModule):
         # Q-learning, value gradient
         return nn.MSELoss()(state_action_values, expected_state_action_values)
 
-    def training_step(self, batch: Tuple[torch.Tensor, torch.Tensor], nb_batch) -> pl.TrainResult:
+    def training_step(self, batch: Tuple[torch.Tensor, torch.Tensor], nb_batch) -> OrderedDict:
         device = self.get_device(batch)
         epsilon = max(self.hparams.eps_end, self.hparams.eps_start -
                       self.global_step + 1 / self.hparams.eps_last_frame)
@@ -223,15 +237,44 @@ class DQNModule(pl.LightningModule):
 
         return OrderedDict({'loss': loss, 'progress_bar': log})
 
+    def validation_step(self, batch: Tuple[torch.Tensor, torch.Tensor], batch_idx: int) -> OrderedDict:
+        device = self.get_device(batch)
+        epsilon = max(self.hparams.eps_end, self.hparams.eps_start -
+                      self.global_step + 1 / self.hparams.eps_last_frame)
+
+        # step through environment with agent
+        reward, done = self.agent.eval_step(self.net, epsilon, device)
+
+        # calculates training loss
+        with torch.no_grad():
+            loss = self.dqn_mse_loss(batch)
+
+        if self.trainer.use_dp or self.trainer.use_ddp2:
+            loss = loss.unsqueeze(0)
+
+        if done:
+            reward = 0.0
+
+        log = {'val_loss': loss, 'reward': reward}
+
+        # print(loss)
+        return OrderedDict({'val_loss': loss, 'log': log})
+
     def configure_optimizers(self) -> List[Optimizer]:
         optimizer = optim.Adam(self.net.parameters(), lr=self.hparams.lr)
         return [optimizer]
 
-    def train_dataloader(self) -> DataLoader:
+    def __dataloader(self) -> DataLoader:
         dataset = RLDataset(self.buffer, self.hparams.episode_length)
         dataloader = DataLoader(dataset=dataset,
                                 batch_size=self.hparams.batch_size)
         return dataloader
+
+    def train_dataloader(self) -> DataLoader:
+        return self.__dataloader()
+
+    def val_dataloader(self) -> DataLoader:
+        return self.__dataloader()
 
     def get_device(self, batch) -> str:
         return batch[0].device.index if self.on_gpu else 'cpu'
@@ -242,13 +285,13 @@ def train(hparams) -> None:
     tb_logger = pl.loggers.TensorBoardLogger('logs/')
     log_dir = tb_logger.log_dir
     ckpt_dir = os.path.join(log_dir, 'checkpoints')
-    ckpt_path = os.path.join(ckpt_dir, '{epoch}_{steps:.2f}')
+    ckpt_path = os.path.join(ckpt_dir, '{epoch}_{val_loss:.2f}_{reward:.2f}')
 
     ckpt_callback = ModelCheckpoint(
         filepath=ckpt_path,
         save_top_k=3,
-        verbose=False,
-        monitor='loss',
+        verbose=True,
+        monitor='val_loss',
         mode='min',
         period=10,
         save_last=True
