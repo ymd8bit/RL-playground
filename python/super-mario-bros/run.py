@@ -1,3 +1,4 @@
+import os
 import argparse
 from typing import Tuple, List
 import time
@@ -15,10 +16,10 @@ from nes_py.wrappers import JoypadSpace
 import torch
 from torch import nn, optim
 from torch.optim.optimizer import Optimizer
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, IterableDataset
 
-from torch.utils.data import IterableDataset
 import pytorch_lightning as pl
+from pytorch_lightning.callbacks import ModelCheckpoint
 
 
 class MLP(nn.Module):
@@ -216,13 +217,11 @@ class DQNModule(pl.LightningModule):
         self.logger.experiment.add_scalar(
             'metrics/reward', reward, self.global_step)
 
-        result = pl.TrainResult(minimize=loss)
         log = {'total_reward': self.total_reward,
                'reward': reward,
                'steps': self.global_step}
-        result.log('progress_bar', log)
 
-        return result
+        return OrderedDict({'loss': loss, 'progress_bar': log})
 
     def configure_optimizers(self) -> List[Optimizer]:
         optimizer = optim.Adam(self.net.parameters(), lr=self.hparams.lr)
@@ -241,14 +240,34 @@ class DQNModule(pl.LightningModule):
 def train(hparams) -> None:
     model = DQNModule(hparams)
     tb_logger = pl.loggers.TensorBoardLogger('logs/')
-    trainer = pl.Trainer(
-        logger=tb_logger,
-        gpus=hparams.gpus,
-        # distributed_backend='dp',
-        max_epochs=hparams.max_epochs,
-        early_stop_callback=False,
-        val_check_interval=100
+    log_dir = tb_logger.log_dir
+    ckpt_dir = os.path.join(log_dir, 'checkpoints')
+    ckpt_path = os.path.join(ckpt_dir, '{epoch}_{steps:.2f}')
+
+    ckpt_callback = ModelCheckpoint(
+        filepath=ckpt_path,
+        save_top_k=3,
+        period=1,
+        verbose=True,
+        monitor='loss',
+        mode='min',
+        save_last=True
     )
+
+    trainer_args = {
+        "logger": tb_logger,
+        "checkpoint_callback": ckpt_callback,
+        "gpus": hparams.gpus,
+        "max_epochs": hparams.max_epochs,
+        "early_stop_callback": False,
+        "val_check_interval": 10,
+        # "distributed_backend='dp',
+    }
+
+    if hparams.ckpt_path != "":
+        trainer_args['resume_from_checkpoint'] = hparams.ckpt_path
+
+    trainer = pl.Trainer(**trainer_args)
     trainer.fit(model)
 
 
