@@ -21,9 +21,9 @@ from torch.utils.data import IterableDataset
 import pytorch_lightning as pl
 
 
-class DQN(nn.Module):
+class MLP(nn.Module):
     def __init__(self, obs_size: int, n_actions: int, hidden_size: int = 1024):
-        super(DQN, self).__init__()
+        super(MLP, self).__init__()
         self.obs_size = obs_size
         self.net = nn.Sequential(
             nn.Linear(obs_size, hidden_size),
@@ -113,14 +113,29 @@ class Agent:
         return reward, done
 
 
+env_keys = ['cartpole', 'super-mario-bros']
+
+
+def make_env(env_key: str):
+    assert env_key in env_keys
+    if env_key == 'cartpole':
+        name = 'CartPole-v0'
+        return gym.make(name)
+    elif env_keys == 'super-mario-bros':
+        name = 'SuperMarioBros-v0'
+        env = gym.make(name)
+        return JoypadSpace(env, SIMPLE_MOVEMENT)
+    else:
+        raise NotImplementedError
+
+
 class DQNModule(pl.LightningModule):
 
     def __init__(self, hparams: argparse.Namespace) -> None:
         super().__init__()
         self.hparams = hparams
+        self.env = make_env(self.hparams.env_key)
 
-        env = gym.make(self.hparams.env)
-        self.env = JoypadSpace(env, SIMPLE_MOVEMENT)
         obs_shape = self.env.observation_space.shape
         obs_size = reduce(operator.mul, obs_shape, 1)
         n_actions = self.env.action_space.n
@@ -128,8 +143,8 @@ class DQNModule(pl.LightningModule):
         self.hparams.observation_space_shape = torch.Tensor(obs_shape)
         self.hparams.observation_space_size = obs_size
 
-        self.net = DQN(obs_size, n_actions)
-        self.target_net = DQN(obs_size, n_actions)
+        self.net = MLP(obs_size, n_actions)
+        self.target_net = MLP(obs_size, n_actions)
 
         self.buffer = ReplayBuffer(self.hparams.replay_size)
         self.agent = Agent(self.env, self.buffer)
@@ -221,7 +236,7 @@ def train(hparams) -> None:
         logger=tb_logger,
         gpus=hparams.gpus,
         # distributed_backend='dp',
-        max_epochs=10000,
+        max_epochs=hparams.max_epochs,
         early_stop_callback=False,
         val_check_interval=100
     )
@@ -230,8 +245,7 @@ def train(hparams) -> None:
 
 def test(hparams) -> None:
     assert hparams.ckpt_path != '', 'you must take an path to checkpoint when test'
-    model = DQNModule.load_from_checkpoint(
-        hparams.ckpt_path, env='SuperMarioBros-v0')
+    model = DQNModule.load_from_checkpoint(hparams.ckpt_path)
     qnet = model.net
     agent = model.agent
     epsilon = max(hparams.eps_end, hparams.eps_start -
@@ -255,34 +269,36 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     modes = ['train', 'test']
     parser.add_argument('mode', type=str, choices=modes, help='mode to run')
-    parser.add_argument('--batch_size', type=int,
+    parser.add_argument('--batch-size', type=int,
                         default=16, help='size of the batches')
+    parser.add_argument('--max-epochs', type=int, default=10000,
+                        help='how many epoch you train your network')
     parser.add_argument('--lr', type=float, default=1e-2, help='learning rate')
-    parser.add_argument('--env', type=str,
-                        default='SuperMarioBros-v0', help='gym environment tag')
+    parser.add_argument('--env-key', type=str, choices=env_keys,
+                        default=env_keys[0], help='environment key for gym')
     parser.add_argument('--gamma', type=float,
                         default=0.99, help='discount factor')
-    parser.add_argument('--sync_rate', type=int, default=10,
+    parser.add_argument('--sync-rate', type=int, default=10,
                         help='how many frames do we update the target network')
-    parser.add_argument('--replay_size', type=int, default=1000,
+    parser.add_argument('--replay-size', type=int, default=1000,
                         help='capacity of the replay buffer')
-    parser.add_argument('--warm_start_size', type=int, default=1000,
+    parser.add_argument('--warm-start-size', type=int, default=1000,
                         help='how many samples do we use to fill our buffer at the start of training')
-    parser.add_argument('--eps_last_frame', type=int, default=1000,
+    parser.add_argument('--eps-last-frame', type=int, default=1000,
                         help='what frame should epsilon stop decaying')
-    parser.add_argument('--eps_start', type=float,
+    parser.add_argument('--eps-start', type=float,
                         default=1.0, help='starting value of epsilon')
-    parser.add_argument('--eps_end', type=float,
+    parser.add_argument('--eps-end', type=float,
                         default=0.01, help='final value of epsilon')
-    parser.add_argument('--episode_length', type=int,
+    parser.add_argument('--episode-length', type=int,
                         default=200, help='max length of an episode')
-    parser.add_argument('--max_episode_reward', type=int, default=200,
+    parser.add_argument('--max-episode-reward', type=int, default=200,
                         help='max episode reward in the environment')
-    parser.add_argument('--warm_start_steps', type=int, default=1000,
+    parser.add_argument('--warm-start-steps', type=int, default=1000,
                         help='max episode reward in the environment')
     parser.add_argument('--gpus', type=int,
                         default=0, help='number of gpus')
-    parser.add_argument('--ckpt_path', type=str, default='',
+    parser.add_argument('--ckpt-path', type=str, default='',
                         help='path to checkpoint to resume training or do test')
 
     hparams = parser.parse_args()

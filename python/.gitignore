@@ -1,5 +1,6 @@
 AlphaZeroBook/
 __pycache__/
 .mypy_cache/
+venv/
 logs/
 *.ckpt
