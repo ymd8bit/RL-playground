@@ -247,10 +247,10 @@ def train(hparams) -> None:
     ckpt_callback = ModelCheckpoint(
         filepath=ckpt_path,
         save_top_k=3,
-        period=1,
-        verbose=True,
+        verbose=False,
         monitor='loss',
         mode='min',
+        period=10,
         save_last=True
     )
 
