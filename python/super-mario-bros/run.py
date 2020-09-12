@@ -25,6 +25,7 @@ class MLP(nn.Module):
     def __init__(self, obs_size: int, n_actions: int, hidden_size: int = 1024):
         super(MLP, self).__init__()
         self.obs_size = obs_size
+        self.obs_size = obs_size
         self.net = nn.Sequential(
             nn.Linear(obs_size, hidden_size),
             nn.ReLU(),
@@ -165,16 +166,24 @@ class DQNModule(pl.LightningModule):
     def dqn_mse_loss(self, batch: Tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
         states, actions, rewards, dones, next_states = batch
 
+        with torch.no_grad():
+            value = self.net(states)
+
+        # Q(s, a)
+        # it picks up the Q values with taken actions in this state
         state_action_values = self.net(states).gather(
             1, actions.unsqueeze(-1)).squeeze(-1)
 
         with torch.no_grad():
-            next_state_values = self.target_net(next_states).max(1)[0]
+            # V(s') = max(a) { Q(s) }
+            next_state_values = self.target_net(next_states).max(1).values
             next_state_values[dones] = 0.0
             next_state_values = next_state_values.detach()
 
-        expected_state_action_values = next_state_values * self.hparams.gamma + rewards
+        # it's Q-learning so, expected Q(s) = R(s) + γ・V(s')
+        expected_state_action_values = rewards + self.hparams.gamma * next_state_values
 
+        # Q-learning, value gradient
         return nn.MSELoss()(state_action_values, expected_state_action_values)
 
     def training_step(self, batch: Tuple[torch.Tensor, torch.Tensor], nb_batch) -> pl.TrainResult:
@@ -253,8 +262,15 @@ def test(hparams) -> None:
     fps = 60
 
     for ep in range(hparams.episode_length):
-        agent.play_step(qnet, epsilon, device='cpu', render=True)
+        reward, done = agent.play_step(
+            qnet, epsilon, device='cpu', render=True)
         time.sleep((1 / fps) * 0.001)
+
+        if done:
+            print('env done with episode ', ep)
+
+    agent.env.close()
+
     # trainer = pl.Trainer(
     #     gpus=hparams.gpus,
     #     max_epochs=1000,
