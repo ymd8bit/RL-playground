@@ -1,5 +1,6 @@
 import argparse
 from typing import Tuple, List
+import time
 from collections import namedtuple, deque, OrderedDict
 from functools import reduce  # Required in Python 3
 import operator
@@ -96,11 +97,9 @@ class Agent:
         return action
 
     @torch.no_grad()
-    def play_step(self, net: nn.Module, epsilon: float = 0.0, device: str = 'cpu', render: bool = False) -> Tuple[float, bool]:
+    def play_step(self, net: nn.Module, epsilon: float = 0.0, device: str = 'cpu') -> Tuple[float, bool]:
         action = self.get_action(net, epsilon, device)
         new_state, reward, done, _ = self.env.step(action)
-        if render:
-            self.env.render()
         exp = Experience(self.state, action, reward, done, new_state)
         self.replay_buffer.append(exp)
         self.state = new_state
@@ -109,8 +108,21 @@ class Agent:
             self.reset()
         return reward, done
 
+    @torch.no_grad()
+    def eval_step(self, net: nn.Module, epsilon: float = 0.0, device: str = 'cpu', render: bool = False) -> Tuple[float, bool]:
+        action = self.get_action(net, epsilon, device)
+        new_state, reward, done, _ = self.env.step(action)
+        if render:
+            self.env.render()
+            time.sleep((1 / 60) * 0.001)
+        self.state = new_state
 
-class DQNLightning(pl.LightningModule):
+        if done:
+            self.reset()
+        return reward, done
+
+
+class DQNModule(pl.LightningModule):
 
     def __init__(self, hparams: argparse.Namespace) -> None:
         super().__init__()
@@ -121,6 +133,9 @@ class DQNLightning(pl.LightningModule):
         obs_shape = self.env.observation_space.shape
         obs_size = reduce(operator.mul, obs_shape, 1)
         n_actions = self.env.action_space.n
+
+        self.hparams.observation_space_shape = torch.Tensor(obs_shape)
+        self.hparams.observation_space_size = obs_size
 
         self.net = DQN(obs_size, n_actions)
         self.target_net = DQN(obs_size, n_actions)
@@ -209,7 +224,7 @@ class DQNLightning(pl.LightningModule):
 
 
 def train(hparams) -> None:
-    model = DQNLightning(hparams)
+    model = DQNModule(hparams)
     tb_logger = pl.loggers.TensorBoardLogger('logs/')
     trainer = pl.Trainer(
         logger=tb_logger,
@@ -224,7 +239,7 @@ def train(hparams) -> None:
 
 def test(hparams) -> None:
     assert hparams.ckpt_path != ''
-    model = DQNLightning.load_from_checkpoint(
+    model = DQNModule.load_from_checkpoint(
         hparams.ckpt_path, env='SuperMarioBros-v0')
     qnet = model.net
     agent = model.agent
@@ -232,7 +247,7 @@ def test(hparams) -> None:
                   model.global_step + 1 / hparams.eps_last_frame)
 
     for ep in range(hparams.episode_length):
-        agent.play_step(qnet, epsilon, device='cpu', render=True)
+        agent.eval_step(qnet, epsilon, device='cpu', render=True)
     # trainer = pl.Trainer(
     #     gpus=hparams.gpus,
     #     max_epochs=1000,
