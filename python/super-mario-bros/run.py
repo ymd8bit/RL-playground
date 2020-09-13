@@ -14,6 +14,7 @@ from gym_super_mario_bros.actions import SIMPLE_MOVEMENT
 from nes_py.wrappers import JoypadSpace
 
 import torch
+import torch.nn.functional as F
 from torch import nn, optim
 from torch.optim.optimizer import Optimizer
 from torch.utils.data import DataLoader, IterableDataset
@@ -23,18 +24,20 @@ from pytorch_lightning.callbacks import ModelCheckpoint
 
 
 class MLP(nn.Module):
-    def __init__(self, obs_size: int, n_actions: int, hidden_size: int = 1024):
+    def __init__(self, obs_size: int, n_actions: int, hidden_size: int = 128):
         super(MLP, self).__init__()
-        self.obs_size = obs_size
         self.obs_size = obs_size
         self.net = nn.Sequential(
             nn.Linear(obs_size, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, hidden_size),
             nn.ReLU(),
             nn.Linear(hidden_size, n_actions)
         )
 
     def forward(self, x):
-        return self.net(x.float().reshape(-1, self.obs_size))
+        x = x.float().reshape(-1, self.obs_size)
+        return self.net(x)
 
 
 Experience = namedtuple('Experience',
@@ -52,84 +55,61 @@ class ReplayBuffer:
     def append(self, experience: Experience) -> None:
         self.buffer.append(experience)
 
-    def sample(self, batch_size: int) -> Tuple:
-        indices = np.random.choice(len(self.buffer), batch_size, replace=False)
-        states, actions, rewards, dones, next_states = zip(
-            *[self.buffer[idx] for idx in indices])
-
-        return (np.array(states), np.array(actions), np.array(rewards, dtype=np.float32),
-                np.array(dones, dtype=np.bool), np.array(next_states))
+    def sample(self, sample_size: int) -> Tuple:
+        indices = np.random.choice(
+            len(self.buffer), sample_size, replace=False)
+        s, a, r, done, next_s = zip(*[self.buffer[i] for i in indices])
+        return (np.array(s), np.array(a), np.array(r, dtype=np.float32),
+                np.array(done, dtype=np.bool), np.array(next_s))
 
 
 class RLDataset(IterableDataset):
-    def __init__(self, buffer: ReplayBuffer, sample_size: int = 200) -> None:
+    def __init__(self, buffer: ReplayBuffer, batch_size: int = 200) -> None:
         self.buffer = buffer
-        self.sample_size = sample_size
+        self.batch_size = batch_size
 
     def __iter__(self) -> Tuple:
-        states, actions, rewards, dones, new_states = self.buffer.sample(
-            self.sample_size)
-        for i in range(len(dones)):
-            yield states[i], actions[i], rewards[i], dones[i], new_states[i]
+        s, a, r, done, next_s = self.buffer.sample(self.batch_size)
+        for i in range(len(done)):
+            yield s[i], a[i], r[i], done[i], next_s[i]
 
 
 class Agent:
-    def __init__(self, env: gym.Env, replay_buffer: ReplayBuffer) -> None:
+    def __init__(self, env: gym.Env, replay_buffer: ReplayBuffer, reward_func=None) -> None:
         self.env = env
+        self.reward_func = reward_func
         self.replay_buffer = replay_buffer
         self.reset()
-        self.state = self.env.reset()
 
     def reset(self) -> None:
-        self.state = self.env.reset()
+        self.s = self.env.reset()
 
-    def get_action(self, net: nn.Module, epsilon: float, device: str = 'cpu') -> int:
+    def get_action(self, Q: nn.Module, epsilon: float, device: str = 'cpu') -> int:
         if np.random.random() < epsilon:
-            action = self.env.action_space.sample()
+            return self.env.action_space.sample()
         else:
-            state = torch.tensor([self.state])
+            s = torch.tensor([self.s])
 
             if device not in ['cpu']:
-                state = state.cuda(device)
+                s = s.cuda(device)
 
-            q_values = net(state)
-            _, action = torch.max(q_values, dim=1)
-            action = int(action.item())
+            values = Q(s)
+            _, a = torch.max(values, dim=1)
+            return int(a.item())
 
-        return action
+    # @torch.no_grad()
+    def play_step(self, q: nn.Module, epsilon: float = 0.0, device: str = 'cpu') -> Tuple[float, bool]:
+        a = self.get_action(q, epsilon, device)
 
-    @torch.no_grad()
-    def play_step(self, net: nn.Module, epsilon: float = 0.0, device: str = 'cpu', render: bool = False) -> Tuple[float, bool]:
-        action = self.get_action(net, epsilon, device)
-
-        if render:
-            self.env.render()
-
-        new_state, reward, done, _ = self.env.step(action)
-        exp = Experience(self.state, action, reward, done, new_state)
+        next_s, r, done, _ = self.env.step(a)
+        r = r / 100
+        exp = Experience(self.s, a, r, done, next_s)
         self.replay_buffer.append(exp)
-        self.state = new_state
+        self.s = next_s
 
         if done:
             self.reset()
-        return reward, done
-
-    @torch.no_grad()
-    def eval_step(self, net: nn.Module, epsilon: float = 0.0, device: str = 'cpu', render: bool = False) -> Tuple[float, bool]:
-        action = self.get_action(net, epsilon, device)
-
-        if render:
-            self.env.render()
-
-        new_state, reward, done, _ = self.env.step(action)
-        self.state = new_state
-
-        if done:
-            self.reset()
-        return reward, done
-
-
-env_keys = ['cartpole', 'super-mario-bros']
+        return r, done
 
 
 def make_env(env_key: str):
@@ -154,118 +134,91 @@ class DQNModule(pl.LightningModule):
 
         obs_shape = self.env.observation_space.shape
         obs_size = reduce(operator.mul, obs_shape, 1)
-        n_actions = self.env.action_space.n
+        as_size = self.env.action_space.n
 
-        self.hparams.observation_space_shape = torch.Tensor(obs_shape)
-        self.hparams.observation_space_size = obs_size
-
-        self.net = MLP(obs_size, n_actions)
-        self.target_net = MLP(obs_size, n_actions)
+        self.Q = MLP(obs_size, as_size)
+        self.Q_target = MLP(obs_size, as_size)
 
         self.buffer = ReplayBuffer(self.hparams.replay_size)
         self.agent = Agent(self.env, self.buffer)
 
+        self.epsilon = self.hparams.eps_max
         self.total_reward = 0
         self.episode_reward = 0
 
-        self.populate(self.hparams.warm_start_steps)
+        # initially fill replay buffer
+        for i in range(self.hparams.init_steps):
+            self.agent.play_step(self.Q, epsilon=1.0)
 
-    def populate(self, steps: int = 1000) -> None:
-        for i in range(steps):
-            self.agent.play_step(self.net, epsilon=1.0)
-
-    def forward(self, states: torch.Tensor) -> torch.Tensor:
-        out = self.net(states)
+    def forward(self, s: torch.Tensor) -> torch.Tensor:
+        out = self.Q(s)
         return out
 
-    def dqn_mse_loss(self, batch: Tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
-        states, actions, rewards, dones, next_states = batch
-
-        with torch.no_grad():
-            value = self.net(states)
-
-        # Q(s, a)
+    def loss(self, batch: Tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
+        s, a, r, done, next_s = batch
+        # estimation
         # it picks up the Q values with taken actions in this state
-        state_action_values = self.net(states).gather(
-            1, actions.unsqueeze(-1)).squeeze(-1)
+        estimation = self.Q(s).gather(1, a.unsqueeze(-1)).squeeze(-1)
 
+        # V(s') = max(a) { Q(s) } with 0 if done
         with torch.no_grad():
-            # V(s') = max(a) { Q(s) }
-            next_state_values = self.target_net(next_states).max(1).values
-            next_state_values[dones] = 0.0
-            next_state_values = next_state_values.detach()
+            V_prime = self.Q_target(next_s).max(1).values
+            V_prime[done] = 0.0
+            V_prime = V_prime.detach()
 
-        # it's Q-learning so, expected Q(s) = R(s) + γ・V(s')
-        expected_state_action_values = rewards + self.hparams.gamma * next_state_values
+        # it's Q-learning so, target is R(s) + γ・V(s')
+        target = r + self.hparams.gamma * V_prime
 
-        # Q-learning, value gradient
-        return nn.MSELoss()(state_action_values, expected_state_action_values)
+        # return nn.MSELoss()(estimation, target)
+        return F.smooth_l1_loss(estimation, target)
+
+    def on_epoch_start(self):
+        self.epsilon = max(self.hparams.eps_min, self.hparams.eps_max -
+                           self.current_epoch / self.hparams.eps_last_frame)
 
     def training_step(self, batch: Tuple[torch.Tensor, torch.Tensor], nb_batch) -> OrderedDict:
         device = self.get_device(batch)
-        epsilon = max(self.hparams.eps_end, self.hparams.eps_start -
-                      self.global_step + 1 / self.hparams.eps_last_frame)
 
         # step through environment with agent
-        reward, done = self.agent.play_step(self.net, epsilon, device)
-        self.episode_reward += reward
+        r, done = self.agent.play_step(self.Q, self.epsilon, device)
+        self.episode_reward += r
 
         # calculates training loss
-        loss = self.dqn_mse_loss(batch)
+        loss = self.loss(batch)
 
         if self.trainer.use_dp or self.trainer.use_ddp2:
             loss = loss.unsqueeze(0)
 
         if done:
-            self.total_reward = self.episode_reward
+            self.total_reward += self.episode_reward
             self.episode_reward = 0
 
         # Soft update of target network
-        if self.global_step % self.hparams.sync_rate == 0:
-            self.target_net.load_state_dict(self.net.state_dict())
+        if self.global_step % self.hparams.sync_interval == 0:
+            self.Q_target.load_state_dict(self.Q.state_dict())
 
         self.logger.experiment.add_scalar(
             'metrics/loss', loss, self.global_step)
         self.logger.experiment.add_scalar(
-            'metrics/total_reward', self.total_reward, self.global_step)
+            'metrics/episode_reward', self.episode_reward, self.global_step)
         self.logger.experiment.add_scalar(
-            'metrics/reward', reward, self.global_step)
+            'metrics/epsilon', self.epsilon, self.global_step)
 
-        log = {'total_reward': self.total_reward,
-               'reward': reward,
-               'steps': self.global_step}
+        result = pl.TrainResult(minimize=loss)
+        result.log('loss x 1000', loss * 1000, prog_bar=True, logger=True)
+        result.log('episode_reward', self.episode_reward,
+                   prog_bar=True, logger=True)
+        result.log('epsilon', self.epsilon, prog_bar=True, logger=True)
+        result.log('steps', self.global_step, prog_bar=True)
 
-        return OrderedDict({'loss': loss, 'progress_bar': log})
-
-    def validation_step(self, batch: Tuple[torch.Tensor, torch.Tensor], batch_idx: int) -> OrderedDict:
-        device = self.get_device(batch)
-        epsilon = max(self.hparams.eps_end, self.hparams.eps_start -
-                      self.global_step + 1 / self.hparams.eps_last_frame)
-
-        # step through environment with agent
-        reward, done = self.agent.eval_step(self.net, epsilon, device)
-
-        # calculates training loss
-        with torch.no_grad():
-            loss = self.dqn_mse_loss(batch)
-
-        if self.trainer.use_dp or self.trainer.use_ddp2:
-            loss = loss.unsqueeze(0)
-
-        if done:
-            reward = 0.0
-
-        log = {'val_loss': loss, 'reward': reward}
-
-        # print(loss)
-        return OrderedDict({'val_loss': loss, 'log': log})
+        return result
 
     def configure_optimizers(self) -> List[Optimizer]:
-        optimizer = optim.Adam(self.net.parameters(), lr=self.hparams.lr)
+        optimizer = optim.Adam(self.Q.parameters(), lr=self.hparams.lr)
         return [optimizer]
 
     def __dataloader(self) -> DataLoader:
-        dataset = RLDataset(self.buffer, self.hparams.episode_length)
+        dataset = RLDataset(self.buffer, self.hparams.batch_size)
         dataloader = DataLoader(dataset=dataset,
                                 batch_size=self.hparams.batch_size)
         return dataloader
@@ -283,23 +236,23 @@ class DQNModule(pl.LightningModule):
 def train(hparams) -> None:
     model = DQNModule(hparams)
     tb_logger = pl.loggers.TensorBoardLogger('logs/')
-    log_dir = tb_logger.log_dir
-    ckpt_dir = os.path.join(log_dir, 'checkpoints')
-    ckpt_path = os.path.join(ckpt_dir, '{epoch}_{val_loss:.2f}_{reward:.2f}')
+    # log_dir = tb_logger.log_dir
+    # ckpt_dir = os.path.join(log_dir, 'checkpoints')
+    # ckpt_path = os.path.join(ckpt_dir, '{epoch}_{val_loss:.2f}_{reward:.2f}')
 
-    ckpt_callback = ModelCheckpoint(
-        filepath=ckpt_path,
-        save_top_k=3,
-        verbose=True,
-        monitor='val_loss',
-        mode='min',
-        period=10,
-        save_last=True
-    )
+    # ckpt_callback = ModelCheckpoint(
+    #     filepath=ckpt_path,
+    #     save_top_k=3,
+    #     verbose=True,
+    #     monitor='val_loss',
+    #     mode='min',
+    #     period=10,
+    #     save_last=True
+    # )
 
     trainer_args = {
         "logger": tb_logger,
-        "checkpoint_callback": ckpt_callback,
+        # "checkpoint_callback": ckpt_callback,
         "gpus": hparams.gpus,
         "max_epochs": hparams.max_epochs,
         "early_stop_callback": False,
@@ -316,70 +269,65 @@ def train(hparams) -> None:
 
 def test(hparams) -> None:
     assert hparams.ckpt_path != '', 'you must take an path to checkpoint when test'
+
     model = DQNModule.load_from_checkpoint(hparams.ckpt_path)
-    qnet = model.net
+    env = model.env
+    Q = model.Q
     agent = model.agent
-    epsilon = max(hparams.eps_end, hparams.eps_start -
-                  model.global_step + 1 / hparams.eps_last_frame)
-    fps = 60
+    epsilon = max(hparams.eps_min, hparams.eps_max -
+                  model.global_step / hparams.eps_last_frame)
+    device = 'cpu'
+    interval = hparams.sync_interval
 
-    for ep in range(hparams.episode_length):
-        reward, done = agent.play_step(
-            qnet, epsilon, device='cpu', render=True)
-        time.sleep((1 / fps) * 0.001)
+    for ep in range(hparams.max_epochs):
+        epsilon = 0.01
+        s = env.reset()
+        done = False
+        step = 0
+        score = 0.0
 
-        if done:
-            print('env done with episode ', ep)
+        while not done:
+            step += 1
+            a = agent.get_action(Q, epsilon, device)
+            env.render()
+            next_s, r, done, _ = env.step(a)
+            s = next_s
+            score += r
+
+            if done:
+                print('done')
+
+            if step % interval == 0 and ep != 0:
+                print("episode :{}, step: {}, score : {:.1f}, epsilon : {:.1f}%".format(
+                    ep, step, score, epsilon*100))
 
     agent.env.close()
-
-    # trainer = pl.Trainer(
-    #     gpus=hparams.gpus,
-    #     max_epochs=1000,
-    # )
-    # trainer.test(model)
 
 
 if __name__ == '__main__':
     torch.manual_seed(0)
     np.random.seed(0)
 
-    parser = argparse.ArgumentParser()
     modes = ['train', 'test']
-    parser.add_argument('mode', type=str, choices=modes, help='mode to run')
-    parser.add_argument('--batch-size', type=int,
-                        default=16, help='size of the batches')
-    parser.add_argument('--max-epochs', type=int, default=10000,
-                        help='how many epoch you train your network')
-    parser.add_argument('--lr', type=float, default=1e-2, help='learning rate')
-    parser.add_argument('--env-key', type=str, choices=env_keys,
-                        default=env_keys[0], help='environment key for gym')
-    parser.add_argument('--gamma', type=float,
-                        default=0.99, help='discount factor')
-    parser.add_argument('--sync-rate', type=int, default=10,
-                        help='how many frames do we update the target network')
-    parser.add_argument('--replay-size', type=int, default=1000,
-                        help='capacity of the replay buffer')
-    parser.add_argument('--warm-start-size', type=int, default=1000,
-                        help='how many samples do we use to fill our buffer at the start of training')
-    parser.add_argument('--eps-last-frame', type=int, default=1000,
-                        help='what frame should epsilon stop decaying')
-    parser.add_argument('--eps-start', type=float,
-                        default=1.0, help='starting value of epsilon')
-    parser.add_argument('--eps-end', type=float,
-                        default=0.01, help='final value of epsilon')
-    parser.add_argument('--episode-length', type=int,
-                        default=200, help='max length of an episode')
-    parser.add_argument('--max-episode-reward', type=int, default=200,
-                        help='max episode reward in the environment')
-    parser.add_argument('--warm-start-steps', type=int, default=1000,
-                        help='max episode reward in the environment')
-    parser.add_argument('--gpus', type=int,
-                        default=0, help='number of gpus')
-    parser.add_argument('--ckpt-path', type=str, default='',
-                        help='path to checkpoint to resume training or do test')
+    env_keys = ['cartpole', 'super-mario-bros']
 
-    hparams = parser.parse_args()
+    p = argparse.ArgumentParser()
+    p.add_argument('mode', type=str, choices=modes, help='mode to run')
+    p.add_argument('--batch-size', type=int, default=32)
+    p.add_argument('--max-epochs', type=int, default=10000)
+    p.add_argument('--lr', type=float, default=0.0005)
+    p.add_argument('--env-key', type=str,
+                   choices=env_keys, default=env_keys[0])
+    p.add_argument('--gamma', type=float, default=0.98)
+    p.add_argument('--sync-interval', type=int, default=1000)
+    p.add_argument('--replay-size', type=int, default=50000)
+    p.add_argument('--init-steps', type=int, default=2000)
+    p.add_argument('--eps-min', type=float, default=0.01)
+    p.add_argument('--eps-max', type=float, default=0.08)
+    p.add_argument('--eps-last-frame', type=int, default=5000)
+    p.add_argument('--gpus', type=int, default=0)
+    p.add_argument('--ckpt-path', type=str, default='')
+    hparams = p.parse_args()
 
     if hparams.mode == 'train':
         train(hparams)
