@@ -4,12 +4,14 @@ import random
 from functools import reduce  # Required in Python 3
 import operator
 
-import gym
+import numpy as np
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+
+from utils import make_env, ENV_KEYS
 
 
 class ReplayBuffer():
@@ -40,7 +42,7 @@ class ReplayBuffer():
 
 
 class MLP(nn.Module):
-    def __init__(self, obs_size, action_size, hidden_size=128):
+    def __init__(self, obs_size, action_size, hidden_size=1024):
         super(MLP, self).__init__()
         self.obs_size = obs_size
         self.net = nn.Sequential(
@@ -55,6 +57,7 @@ class MLP(nn.Module):
         x = x.reshape(-1, self.obs_size)
         return self.net(x)
 
+    @torch.no_grad()
     def sample_action(self, obs, epsilon):
         action = self.forward(obs)
         if random.random() < epsilon:
@@ -69,9 +72,12 @@ def train_network(q, q_target, memory, optimizer, args):
     for i in range(10):
         s, a, r, s_prime, done_mask = memory.sample(args.batch_size)
 
-        q_out = q(s)
-        q_a = q_out.gather(1, a)
-        max_q_prime = q_target(s_prime).max(1)[0].unsqueeze(1)
+        if torch.cuda.is_available() and args.device == 'gpu':
+            s = s.cuda()
+
+        q_a = q(s).gather(1, a)
+        with torch.no_grad():
+            max_q_prime = q_target(s_prime).max(1)[0].unsqueeze(1)
         target = r + args.gamma * max_q_prime * done_mask
         loss = F.smooth_l1_loss(q_a, target)
         loss_list.append(loss)
@@ -84,10 +90,11 @@ def train_network(q, q_target, memory, optimizer, args):
 
 
 def train(args):
-    env = gym.make('CartPole-v1')
+    env = make_env(args.env_key)
     obs_shape = env.observation_space.shape
     obs_size = reduce(operator.mul, obs_shape, 1)
     action_size = env.action_space.n
+
     q = MLP(obs_size, action_size)
     q_target = MLP(obs_size, action_size)
     q_target.load_state_dict(q.state_dict())
@@ -101,10 +108,10 @@ def train(args):
         # Linear annealing from 8% to 1%
         epsilon = max(0.01, 0.08 - 0.01*(ep/200))
         s = env.reset()
-        done = False
 
-        while not done:
-            a = q.sample_action(torch.from_numpy(s).float(), epsilon)
+        while True:
+            s = torch.from_numpy(np.array(s)).float()
+            a = q.sample_action(s, epsilon)
             s_prime, r, done, info = env.step(a)
             done_mask = 0.0 if done else 1.0
             memory.put((s, a, r, s_prime, done_mask))
@@ -119,7 +126,7 @@ def train(args):
         else:
             loss = 0.0
 
-        if ep % interval == 0 and ep != 0:
+        if ep % interval == 0:
             q_target.load_state_dict(q.state_dict())
             print("episode :{}, score : {:.1f}, loss : {:.8f}, epsilon : {:.1f}%".format(
                 ep, score/interval, loss, epsilon*100))
@@ -133,8 +140,8 @@ def train(args):
 
 def test(args):
     assert args.weight_path is not None
+    env = make_env(args.env_key)
 
-    env = gym.make('CartPole-v1')
     obs_shape = env.observation_space.shape
     obs_size = reduce(operator.mul, obs_shape, 1)
     action_size = env.action_space.n
@@ -170,9 +177,14 @@ def test(args):
 if __name__ == '__main__':
     torch.manual_seed(0)
     modes = ['train', 'test']
+    devices = ['cpu', 'gpu']
 
     p = argparse.ArgumentParser()
     p.add_argument('mode', type=str, choices=modes)
+    p.add_argument('--env-key', type=str,
+                   choices=ENV_KEYS, default=ENV_KEYS[0])
+    p.add_argument('--device', type=str,
+                   choices=devices, default=devices[0])
     p.add_argument('--batch-size', type=int, default=32)
     p.add_argument('--max-epochs', type=int, default=3000)
     p.add_argument('--lr', type=float, default=0.0005)
@@ -183,6 +195,7 @@ if __name__ == '__main__':
     p.add_argument('--save-interval', type=int, default=100)
     p.add_argument('--weight-path', type=str, default=None)
     args = p.parse_args()
+    print(args)
 
     if args.mode == 'train':
         train(args)
