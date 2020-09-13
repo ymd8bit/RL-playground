@@ -1,4 +1,7 @@
-import argparse
+import gym
+import gym_super_mario_bros
+from gym_super_mario_bros.actions import SIMPLE_MOVEMENT
+from nes_py.wrappers import JoypadSpace
 import collections
 import random
 from functools import reduce  # Required in Python 3
@@ -11,11 +14,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 
-from utils import make_env, ENV_KEYS
+# Hyperparameters
+learning_rate = 0.0005
+gamma = 0.98
+buffer_limit = 50000
+batch_size = 16
 
 
 class ReplayBuffer():
-    def __init__(self, buffer_limit):
+    def __init__(self):
         self.buffer = collections.deque(maxlen=buffer_limit)
 
     def put(self, transition):
@@ -59,6 +66,8 @@ class MLP(nn.Module):
 
     @torch.no_grad()
     def sample_action(self, obs, epsilon):
+        if torch.cuda.is_available():
+            obs = obs.cuda()
         action = self.forward(obs)
         if random.random() < epsilon:
             return random.randint(0, 1)
@@ -66,31 +75,30 @@ class MLP(nn.Module):
             return action.argmax().item()
 
 
-def train_network(q, q_target, memory, optimizer, args):
-    loss_list = []
-
+def train(q, q_target, memory, optimizer):
     for i in range(10):
-        s, a, r, s_prime, done_mask = memory.sample(args.batch_size)
-
-        if torch.cuda.is_available() and args.device == 'gpu':
+        s, a, r, s_prime, done_mask = memory.sample(batch_size)
+        if torch.cuda.is_available():
             s = s.cuda()
+            s_prime = s_prime.cuda()
+            done_mask = done_mask.cuda()
+            r = r.cuda()
+            a = a.cuda()
 
-        q_a = q(s).gather(1, a)
-        with torch.no_grad():
-            max_q_prime = q_target(s_prime).max(1)[0].unsqueeze(1)
-        target = r + args.gamma * max_q_prime * done_mask
+        q_out = q(s)
+        q_a = q_out.gather(1, a)
+        max_q_prime = q_target(s_prime).max(1)[0].unsqueeze(1)
+        target = r + gamma * max_q_prime * done_mask
         loss = F.smooth_l1_loss(q_a, target)
-        loss_list.append(loss)
 
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
 
-    return torch.sum(torch.Tensor(loss_list))
 
-
-def train(args):
-    env = make_env(args.env_key)
+def main():
+    env = gym.make('SuperMarioBros-v0')
+    env = JoypadSpace(env, SIMPLE_MOVEMENT)
     obs_shape = env.observation_space.shape
     obs_size = reduce(operator.mul, obs_shape, 1)
     action_size = env.action_space.n
@@ -98,106 +106,42 @@ def train(args):
     q = MLP(obs_size, action_size)
     q_target = MLP(obs_size, action_size)
     q_target.load_state_dict(q.state_dict())
-    memory = ReplayBuffer(args.buffer_limit)
+    if torch.cuda.is_available():
+        q = q.cuda()
+        q_target = q_target.cuda()
 
+    memory = ReplayBuffer()
+    print_interval = 20
     score = 0.0
-    interval = args.sync_interval
-    optimizer = optim.Adam(q.parameters(), lr=args.lr)
+    optimizer = optim.Adam(q.parameters(), lr=learning_rate)
 
-    for ep in range(args.max_epochs):
-        # Linear annealing from 8% to 1%
-        epsilon = max(0.01, 0.08 - 0.01*(ep/200))
+    for n_epi in range(10000):
+        epsilon = max(0.01, 0.08 - 0.01*(n_epi/200)
+                      )  # Linear annealing from 8% to 1%
         s = env.reset()
+        done = False
 
-        while True:
-            s = torch.from_numpy(np.array(s)).float()
-            a = q.sample_action(s, epsilon)
+        while not done:
+            a = q.sample_action(torch.from_numpy(np.array(s)).float(), epsilon)
             s_prime, r, done, info = env.step(a)
             done_mask = 0.0 if done else 1.0
-            memory.put((s, a, r, s_prime, done_mask))
+            memory.put((s, a, r/100.0, s_prime, done_mask))
             s = s_prime
 
             score += r
             if done:
                 break
 
-        if memory.size() > args.init_steps:
-            loss = train_network(q, q_target, memory, optimizer, args)
-        else:
-            loss = 0.0
+        if memory.size() > 2000:
+            train(q, q_target, memory, optimizer)
 
-        if ep % interval == 0:
+        if n_epi % print_interval == 0 and n_epi != 0:
             q_target.load_state_dict(q.state_dict())
-            print("episode :{}, score : {:.1f}, loss : {:.8f}, epsilon : {:.1f}%".format(
-                ep, score/interval, loss, epsilon*100))
+            print("n_episode :{}, score : {:.1f}, n_buffer : {}, eps : {:.1f}%".format(
+                n_epi, score/print_interval, memory.size(), epsilon*100))
             score = 0.0
-
-        if ep % args.save_interval == 0 and ep != 0:
-            torch.save(q.state_dict(), 'out.pth')
-
-    env.close()
-
-
-def test(args):
-    assert args.weight_path is not None
-    env = make_env(args.env_key)
-
-    obs_shape = env.observation_space.shape
-    obs_size = reduce(operator.mul, obs_shape, 1)
-    action_size = env.action_space.n
-
-    q = MLP(obs_size, action_size)
-    q.load_state_dict(torch.load(args.weight_path))
-    q.eval()
-
-    interval = args.sync_interval
-
-    for ep in range(args.max_epochs):
-        epsilon = 0.01
-        s = env.reset()
-        done = False
-        step = 0
-        score = 0.0
-
-        while not done:
-            step += 1
-            a = q.sample_action(torch.from_numpy(s).float(), epsilon)
-            env.render()
-            s_prime, r, done, info = env.step(a)
-            s = s_prime
-            score += r
-
-            if step % interval == 0 and ep != 0:
-                print("episode :{}, step: {}, score : {:.1f}, epsilon : {:.1f}%".format(
-                    ep, step, score, epsilon*100))
-
     env.close()
 
 
 if __name__ == '__main__':
-    torch.manual_seed(0)
-    modes = ['train', 'test']
-    devices = ['cpu', 'gpu']
-
-    p = argparse.ArgumentParser()
-    p.add_argument('mode', type=str, choices=modes)
-    p.add_argument('--env-key', type=str,
-                   choices=ENV_KEYS, default=ENV_KEYS[0])
-    p.add_argument('--device', type=str,
-                   choices=devices, default=devices[0])
-    p.add_argument('--batch-size', type=int, default=32)
-    p.add_argument('--max-epochs', type=int, default=3000)
-    p.add_argument('--lr', type=float, default=0.0005)
-    p.add_argument('--gamma', type=float, default=0.98)
-    p.add_argument('--buffer-limit', type=int, default=50000)
-    p.add_argument('--init-steps', type=int, default=2000)
-    p.add_argument('--sync-interval', type=int, default=20)
-    p.add_argument('--save-interval', type=int, default=100)
-    p.add_argument('--weight-path', type=str, default=None)
-    args = p.parse_args()
-    print(args)
-
-    if args.mode == 'train':
-        train(args)
-    else:
-        test(args)
+    main()

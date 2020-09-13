@@ -26,7 +26,7 @@ from utils import make_env, ENV_KEYS
 
 
 class MLP(nn.Module):
-    def __init__(self, obs_size: int, n_actions: int, hidden_size: int = 128):
+    def __init__(self, obs_size: int, n_actions: int, hidden_size: int = 1024):
         super(MLP, self).__init__()
         self.obs_size = obs_size
         self.net = nn.Sequential(
@@ -66,13 +66,13 @@ class ReplayBuffer:
 
 
 class RLDataset(IterableDataset):
-    def __init__(self, buffer: ReplayBuffer, batch_size: int, steps_per_epoch: int = 10) -> None:
+    def __init__(self, buffer: ReplayBuffer, batch_size: int, batch_per_epoch: int = 10) -> None:
         self.buffer = buffer
         self.batch_size = batch_size
-        self.steps_per_epoch = steps_per_epoch
+        self.batch_per_epoch = batch_per_epoch
 
     def __iter__(self) -> Tuple:
-        for _ in range(self.steps_per_epoch):
+        for _ in range(self.batch_per_epoch):
             s, a, r, done, next_s = self.buffer.sample(self.batch_size)
             for i in range(len(done)):
                 yield s[i], a[i], r[i], done[i], next_s[i]
@@ -113,18 +113,15 @@ class Agent:
             self.reset()
         return r, done
 
+    @torch.no_grad()
+    def eval_step(self, q: nn.Module, epsilon: float = 0.0, device: str = 'cpu') -> Tuple[float, bool]:
+        a = self.get_action(q, epsilon, device)
+        next_s, r, done, _ = self.env.step(a)
+        self.s = next_s
 
-def make_env(env_key: str):
-    assert env_key in ENV_KEYS
-    if env_key == 'cartpole':
-        name = 'CartPole-v0'
-        return gym.make(name)
-    elif env_keys == 'super-mario-bros':
-        name = 'SuperMarioBros-v0'
-        env = gym.make(name)
-        return JoypadSpace(env, SIMPLE_MOVEMENT)
-    else:
-        raise NotImplementedError
+        if done:
+            self.reset()
+        return r, done
 
 
 class DQNModule(pl.LightningModule):
@@ -150,10 +147,7 @@ class DQNModule(pl.LightningModule):
         self.episode_reward = 0
 
         # initially fill replay buffer
-        self.fill_replay_buffer(self.hparams.init_steps)
-
-    def __del__(self):
-        self.env.close()
+        self.fill_replay_buffer(self.hparams.num_init_states)
 
     def fill_replay_buffer(self, n: int, epsilon: float = 1.0) -> None:
         for _ in range(n):
@@ -190,7 +184,6 @@ class DQNModule(pl.LightningModule):
             self.fill_replay_buffer(100, epsilon)
 
         # step through environment with agent
-        self.env.render()
         r, done = self.agent.play_step(self.Q, epsilon, device)
 
         self.episode_count += 1
@@ -222,12 +215,14 @@ class DQNModule(pl.LightningModule):
         result = pl.TrainResult(minimize=loss)
         result.log('episode_reward', self.episode_reward,
                    prog_bar=True, logger=True)
+        result.log('episode_count', self.episode_count,
+                   prog_bar=True, logger=True)
         result.log('epsilon', epsilon, prog_bar=True, logger=True)
 
         return result
 
     def test_step(self, batch: Tuple[torch.Tensor, torch.Tensor], nb_batch) -> OrderedDict:
-        device = self.get_device(batch)
+        device = self.tget_device(batch)
         epsilon = max(self.hparams.eps_min, self.hparams.eps_max -
                       self.episode_count / self.hparams.eps_last_frame)
 
@@ -268,7 +263,8 @@ class DQNModule(pl.LightningModule):
         return [optimizer]
 
     def __dataloader(self) -> DataLoader:
-        dataset = RLDataset(self.buffer, self.hparams.batch_size)
+        dataset = RLDataset(
+            self.buffer, self.hparams.batch_size, self.hparams.batch_per_epoch)
         dataloader = DataLoader(dataset=dataset,
                                 batch_size=self.hparams.batch_size,
                                 num_workers=self.hparams.num_cpu_threads)
@@ -286,7 +282,7 @@ class DQNModule(pl.LightningModule):
 
 def train(hparams) -> None:
     model = DQNModule(hparams)
-    tb_logger = pl.loggers.TensorBoardLogger('logs/')
+    tb_logger = pl.loggers.TensorBoardLogger(f'{hparams.env_key}_logs/')
     log_dir = tb_logger.log_dir
     ckpt_dir = os.path.join(log_dir, 'checkpoints')
     ckpt_path = os.path.join(ckpt_dir, '{epoch}')
@@ -316,7 +312,7 @@ def train(hparams) -> None:
     trainer.fit(model)
 
 
-def test(hparams) -> None:
+def test2(hparams) -> None:
     assert hparams.ckpt_path != '', 'you must take an path to checkpoint when test'
     model = DQNModule.load_from_checkpoint(hparams.ckpt_path, batch_size=1)
 
@@ -331,34 +327,37 @@ def test(hparams) -> None:
     model.env.close()
 
 
-def test2(hparams) -> None:
+def test(hparams) -> None:
     assert hparams.ckpt_path != '', 'you must take an path to checkpoint when test'
 
     model = DQNModule.load_from_checkpoint(hparams.ckpt_path)
+    model.eval()
+
+    env = model.env
+    agent = model.agent
+    Q = model.Q
+
     device = 'cpu'
     interval = hparams.sync_interval
 
     for ep in range(hparams.max_epochs):
         epsilon = 0.01
-        s = model.env.reset()
-        done = False
         step = 0
         score = 0.0
 
-        while not done:
+        while True:
             step += 1
-            a = model.agent.get_action(model.Q, epsilon, device)
-            model.env.render()
-            next_s, r, done, _ = model.env.step(a)
-            s = next_s
+            env.render()
+            r, done = agent.eval_step(Q, epsilon, device)
             score += r
-
-            if done:
-                print('done')
 
             if step % interval == 0 and ep != 0:
                 print("episode :{}, step: {}, score : {:.1f}, epsilon : {:.1f}%".format(
                     ep, step, score, epsilon*100))
+
+            if done:
+                print("episode :{} done, score : {:.1f}".format(ep, score))
+                break
 
     model.agent.env.close()
 
@@ -380,7 +379,8 @@ if __name__ == '__main__':
     p.add_argument('--sync-interval', type=int, default=1000)
     p.add_argument('--save-interval', type=int, default=20)
     p.add_argument('--replay-size', type=int, default=50000)
-    p.add_argument('--init-steps', type=int, default=50000)
+    p.add_argument('--num-init-states', type=int, default=2000)
+    p.add_argument('--batch-per-epoch', type=int, default=10)
     p.add_argument('--eps-min', type=float, default=0.01)
     p.add_argument('--eps-max', type=float, default=0.08)
     p.add_argument('--eps-last-frame', type=int, default=5000)
