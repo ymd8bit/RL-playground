@@ -1,4 +1,5 @@
 absl-py==0.10.0
+atari-py==0.2.6
 autopep8==1.5.4
 cachetools==4.1.1
 certifi==2020.6.20
@@ -16,7 +17,12 @@ Markdown==3.2.2
 nes-py==8.1.6
 numpy==1.19.2
 oauthlib==3.1.0
+onnx==1.7.0
+onnxruntime-gpu==1.4.0
+opencv-python==4.4.0.42
 packaging==20.4
+Pillow==7.2.0
+pkg-resources==0.0.0
 protobuf==3.13.0
 pyasn1==0.4.8
 pyasn1-modules==0.2.8
@@ -37,7 +43,7 @@ tensorboard-plugin-wit==1.7.0
 toml==0.10.1
 torch==1.6.0
 tqdm==4.48.2
+typing-extensions==3.7.4.3
 urllib3==1.25.10
 Werkzeug==1.0.1
 zipp==3.1.0
-

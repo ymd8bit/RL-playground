@@ -2,6 +2,7 @@ import os
 import argparse
 from typing import Tuple, List
 import time
+import timeit
 from collections import namedtuple, deque, OrderedDict
 from functools import reduce  # Required in Python 3
 import operator
@@ -21,6 +22,9 @@ from torch.utils.data import DataLoader, IterableDataset
 
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint
+
+import onnx
+import onnxruntime as ort
 
 from utils import make_env, ENV_KEYS
 
@@ -79,11 +83,13 @@ class RLDataset(IterableDataset):
 
 
 class Agent:
-    def __init__(self, env: gym.Env, replay_buffer: ReplayBuffer, reward_func=None) -> None:
+    def __init__(self, env: gym.Env, replay_buffer: ReplayBuffer) -> None:
         self.env = env
-        self.reward_func = reward_func
         self.replay_buffer = replay_buffer
         self.reset()
+
+    def update_reward(self, r: float) -> float:
+        return r / 100.0
 
     def reset(self) -> None:
         self.s = self.env.reset()
@@ -105,6 +111,7 @@ class Agent:
         a = self.get_action(q, epsilon, device)
 
         next_s, r, done, _ = self.env.step(a)
+        r = self.update_reward(r)
         exp = Experience(self.s, a, r, done, next_s)
         self.replay_buffer.append(exp)
         self.s = next_s
@@ -131,12 +138,12 @@ class DQNModule(pl.LightningModule):
         self.hparams = hparams
         self.env = make_env(self.hparams.env_key)
 
-        obs_shape = self.env.observation_space.shape
-        obs_size = reduce(operator.mul, obs_shape, 1)
-        as_size = self.env.action_space.n
+        self.obs_shape = self.env.observation_space.shape
+        self.obs_size = reduce(operator.mul, self.obs_shape, 1)
+        self.as_size = self.env.action_space.n
 
-        self.Q = MLP(obs_size, as_size)
-        self.Q_target = MLP(obs_size, as_size)
+        self.Q = MLP(self.obs_size, self.as_size)
+        self.Q_target = MLP(self.obs_size, self.as_size)
 
         self.buffer = ReplayBuffer(self.hparams.replay_size)
         self.agent = Agent(self.env, self.buffer)
@@ -221,38 +228,6 @@ class DQNModule(pl.LightningModule):
 
         return result
 
-    def test_step(self, batch: Tuple[torch.Tensor, torch.Tensor], nb_batch) -> OrderedDict:
-        device = self.tget_device(batch)
-        epsilon = max(self.hparams.eps_min, self.hparams.eps_max -
-                      self.episode_count / self.hparams.eps_last_frame)
-
-        # step through environment with agent
-        self.env.render()
-        r, done = self.agent.play_step(self.Q, epsilon, device)
-
-        self.episode_count += 1
-        self.episode_reward += r
-
-        # calculates training loss
-        loss = self.loss(batch)
-
-        if self.trainer.use_dp or self.trainer.use_ddp2:
-            loss = loss.unsqueeze(0)
-
-        if done:
-            self.env.reset()
-            self.total_reward += self.episode_reward
-            self.episode_count = 0
-            self.episode_reward = 0
-
-        result = pl.EvalResult()
-        result.log('episode_reward', self.episode_reward,
-                   prog_bar=True, logger=True)
-        result.log('epsilon', epsilon, prog_bar=True, logger=True)
-        result.log('loss', loss, prog_bar=True, logger=True)
-
-        return result
-
     def save_metrics(self, metrics: OrderedDict):
         for k, v in metrics.items():
             key = f'metrics/{k}'
@@ -312,32 +287,18 @@ def train(hparams) -> None:
     trainer.fit(model)
 
 
-def test2(hparams) -> None:
-    assert hparams.ckpt_path != '', 'you must take an path to checkpoint when test'
-    model = DQNModule.load_from_checkpoint(hparams.ckpt_path, batch_size=1)
-
-    trainer_args = {
-        "gpus": hparams.gpus,
-        "max_epochs": hparams.max_epochs + 1,
-    }
-
-    # trainer = pl.Trainer(**trainer_args)
-    trainer = pl.Trainer()
-    trainer.test(model)
-    model.env.close()
-
-
 def test(hparams) -> None:
     assert hparams.ckpt_path != '', 'you must take an path to checkpoint when test'
 
     model = DQNModule.load_from_checkpoint(hparams.ckpt_path)
     model.eval()
+    model.cuda()
 
     env = model.env
     agent = model.agent
     Q = model.Q
+    device = 'cuda:0'
 
-    device = 'cpu'
     interval = hparams.sync_interval
 
     for ep in range(hparams.max_epochs):
@@ -348,6 +309,7 @@ def test(hparams) -> None:
         while True:
             step += 1
             env.render()
+            time
             r, done = agent.eval_step(Q, epsilon, device)
             score += r
 
@@ -362,11 +324,151 @@ def test(hparams) -> None:
     model.agent.env.close()
 
 
+def export(hparams) -> str:
+    assert hparams.ckpt_path != '', 'you must take an path to checkpoint when test'
+    model = DQNModule.load_from_checkpoint(hparams.ckpt_path)
+    model.eval()
+    input_shape = model.obs_shape
+    dummy = torch.randn(*input_shape)
+    export_name = 'Q.{}.onnx'.format(model.hparams.env_key)
+    export_path = os.path.join(os.getcwd(), export_name)
+    torch.onnx.export(model.Q, dummy, export_path, verbose=True)
+    return export_path
+
+
+def evaluate(hparams) -> None:
+    assert hparams.ckpt_path != '', 'you must take an path to checkpoint when test'
+
+    if hparams.onnx_path == "":
+        onnx_path = export(hparams)
+        print('onnx exported: ', onnx_path)
+    else:
+        if os.path.exists(hparams.onnx_path):
+            onnx_path = hparams.onnx_path
+        else:
+            raise NotImplementedError
+
+    model = DQNModule.load_from_checkpoint(hparams.ckpt_path)
+    env = model.env
+
+    sess = ort.InferenceSession(onnx_path)
+    print(sess.get_providers())
+    inputs = sess.get_inputs()
+    outputs = sess.get_outputs()
+    in_name = inputs[0].name
+    in_shape = inputs[0].shape
+
+    def get_action(s, epsilon):
+        if np.random.random() < epsilon:
+            return env.action_space.sample()
+        else:
+            s = np.array(s)
+            q_value = sess.run(None, {in_name: s.astype(np.float32)})
+            a = np.argmax(q_value[0])
+            return a
+
+    interval = hparams.sync_interval
+
+    for ep in range(hparams.max_epochs):
+        epsilon = 0.01
+        step = 0
+        score = 0.0
+        s = env.reset()
+
+        while True:
+            step += 1
+            env.render()
+            a = get_action(s, epsilon)
+            next_s, r, done, _ = env.step(a)
+            score += r
+            s = next_s
+
+            if step % interval == 0 and ep != 0:
+                print("episode :{}, step: {}, score : {:.1f}, epsilon : {:.1f}%".format(
+                    ep, step, score, epsilon*100))
+
+            if done:
+                print("episode :{} done, score : {:.1f}".format(ep, score))
+                break
+
+            time.sleep(1.0 / float(hparams.fps))
+
+    model.agent.env.close()
+
+
+def profile(hparams) -> None:
+    assert hparams.ckpt_path != '', 'you must take an path to checkpoint when test'
+
+    if hparams.onnx_path == "":
+        onnx_path = export(hparams)
+        print('onnx exported: ', onnx_path)
+    else:
+        if os.path.exists(hparams.onnx_path):
+            onnx_path = hparams.onnx_path
+        else:
+            raise NotImplementedError
+
+    model = DQNModule.load_from_checkpoint(hparams.ckpt_path)
+    model.eval()
+    env = model.env
+    Q = model.Q
+
+    sess = ort.InferenceSession(onnx_path)
+    inputs = sess.get_inputs()
+    outputs = sess.get_outputs()
+    in_name = inputs[0].name
+    in_shape = inputs[0].shape
+
+    device = 'cuda:0'
+
+    def run_pytorch(s):
+        return Q(s)
+
+    def run_pytorch_cuda(s):
+        Q.cuda()
+        s = s.cuda()
+        return Q(s)
+
+    def run_ort(s):
+        return sess.run(None, {in_name: s})
+
+    def measure_time(f, s):
+        rep = 50
+        num = 50
+        costs = timeit.repeat(lambda: f(s), repeat=rep, number=num)
+        costs = np.array(costs) / num
+        std = np.std(costs) * 1000
+        mean = np.mean(costs) * 1000
+        return mean, std
+
+    def run(tag, f, s):
+        mean, std = measure_time(f, s)
+        print(tag)
+        print("performance: %.2fms (std = %.2f)" % (mean, std))
+
+    s = env.reset()
+    s = s.astype(np.float32)
+    s_torch = torch.tensor(s)
+
+    run("pytorch_cpu", run_pytorch, s_torch)
+
+    run("pytorch_cuda", run_pytorch_cuda, s_torch)
+
+    sess.set_providers(['CPUExecutionProvider'])
+    run("onnxruntime_cpu", run_ort, s)
+
+    sess.set_providers(['CUDAExecutionProvider'])
+    run("onnxruntime_cuda", run_ort, s)
+
+    sess.set_providers(['TensorrtExecutionProvider'])
+    run("onnxruntime_tensorrt", run_ort, s)
+
+
 if __name__ == '__main__':
     torch.manual_seed(0)
     np.random.seed(0)
 
-    modes = ['train', 'test']
+    modes = ['train', 'test', 'export', 'evaluate', 'profile']
 
     p = argparse.ArgumentParser()
     p.add_argument('mode', type=str, choices=modes, help='mode to run')
@@ -385,13 +487,21 @@ if __name__ == '__main__':
     p.add_argument('--eps-max', type=float, default=0.08)
     p.add_argument('--eps-last-frame', type=int, default=5000)
     p.add_argument('--ckpt-path', type=str, default='')
+    p.add_argument('--onnx-path', type=str, default='')
     p.add_argument('--gpus', type=int, default=0)
     p.add_argument('--num-cpu-threads', type=int, default=16)
+    p.add_argument('--fps', type=int, default=100)
     hparams = p.parse_args()
 
     if hparams.mode == 'train':
         train(hparams)
     elif hparams.mode == 'test':
         test(hparams)
+    elif hparams.mode == 'export':
+        export(hparams)
+    elif hparams.mode == 'evaluate':
+        evaluate(hparams)
+    elif hparams.mode == 'profile':
+        profile(hparams)
     else:
         raise NotImplementedError
