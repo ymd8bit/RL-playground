@@ -44,6 +44,6 @@ toml==0.10.1
 torch==1.6.0
 tqdm==4.48.2
 typing-extensions==3.7.4.3
-urllib3==1.25.10
+urllib3==1.26.5
 Werkzeug==1.0.1
 zipp==3.1.0
